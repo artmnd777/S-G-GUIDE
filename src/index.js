@@ -1,4 +1,5 @@
 const fs = require('fs');
+const http = require('http');
 const path = require('path');
 const { Telegraf } = require('telegraf');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -12,10 +13,11 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5.5';
 const MAX_HISTORY_MESSAGES = Number(process.env.MAX_HISTORY_MESSAGES || 12);
-const BOT_MODE = (process.env.BOT_MODE || 'polling').toLowerCase();
+const BOT_MODE = (process.env.BOT_MODE || (process.env.RENDER ? 'webhook' : 'polling')).toLowerCase();
 const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL;
 const WEBHOOK_PATH = process.env.WEBHOOK_PATH || '/telegram-webhook';
 const PORT = Number(process.env.PORT || 3000);
+const SKIP_SET_WEBHOOK = process.env.SKIP_SET_WEBHOOK === 'true';
 
 if (!TELEGRAM_BOT_TOKEN) {
   throw new Error('TELEGRAM_BOT_TOKEN is required');
@@ -87,6 +89,22 @@ async function generateAnswer(chatId, userText) {
   return generateWithGemini(chatId, userText);
 }
 
+async function setWebhookWithRetry(url, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt += 1) {
+    try {
+      await bot.telegram.setWebhook(url);
+      return;
+    } catch (error) {
+      const retryAfter = error.response?.parameters?.retry_after;
+      if (error.response?.error_code !== 429 || !retryAfter || attempt === retries) {
+        throw error;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, (retryAfter + 1) * 1000));
+    }
+  }
+}
+
 bot.start((ctx) => {
   histories.delete(ctx.chat.id);
   return ctx.reply(
@@ -134,14 +152,39 @@ async function startBot() {
       throw new Error('WEBHOOK_BASE_URL is required when BOT_MODE=webhook');
     }
 
-    await bot.telegram.setWebhook(`${WEBHOOK_BASE_URL}${WEBHOOK_PATH}`);
-    await bot.launch({
-      webhook: {
-        domain: WEBHOOK_BASE_URL,
-        hookPath: WEBHOOK_PATH,
-        port: PORT
+    const server = http.createServer((req, res) => {
+      if (req.method === 'GET' && req.url === '/') {
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Starter/generator Telegram bot is running');
+        return;
       }
+
+      if (req.method !== 'POST' || req.url !== WEBHOOK_PATH) {
+        res.writeHead(404);
+        res.end('Not found');
+        return;
+      }
+
+      let body = '';
+      req.on('data', (chunk) => {
+        body += chunk.toString('utf8');
+      });
+      req.on('end', async () => {
+        try {
+          await bot.handleUpdate(JSON.parse(body || '{}'));
+          res.writeHead(200);
+          res.end('OK');
+        } catch (error) {
+          console.error('Webhook update error:', error);
+          res.writeHead(500);
+          res.end('Webhook error');
+        }
+      });
     });
+    server.listen(PORT);
+    if (!SKIP_SET_WEBHOOK) {
+      await setWebhookWithRetry(`${WEBHOOK_BASE_URL}${WEBHOOK_PATH}`);
+    }
     console.log(`Bot started in webhook mode on port ${PORT} with ${LLM_PROVIDER}:${modelName}`);
     return;
   }
