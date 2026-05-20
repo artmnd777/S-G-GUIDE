@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: starter-generator-telegram-bot
+    env: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: BOT_MODE
+        value: webhook
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash-lite
+      - key: MAX_HISTORY_MESSAGES
+        value: "12"
+      - key: WEBHOOK_PATH
+        value: /telegram-webhook
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: WEBHOOK_BASE_URL
+        sync: false
