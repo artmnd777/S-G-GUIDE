@@ -206,6 +206,30 @@ async function generateAnswer(chatId, userText) {
   return generateWithGemini(chatId, userText);
 }
 
+
+function getFriendlyModelError(error) {
+  const message = [
+    error?.message,
+    error?.response?.data?.error?.message,
+    error?.errorDetails,
+    JSON.stringify(error?.response?.data || {})
+  ].filter(Boolean).join(' ');
+
+  if (/quota|RESOURCE_EXHAUSTED|429|rate limit|exceeded/i.test(message)) {
+    return 'Сейчас бесплатный Gemini временно упёрся в лимит запросов. Подождите 1–2 минуты и отправьте сообщение ещё раз. Если такое будет часто — лучше подключить платный API или запасную модель.';
+  }
+
+  if (/API key|API_KEY|permission|unauthorized|403|401/i.test(message)) {
+    return 'Похоже, проблема с Gemini API key или доступом к модели. Проверьте GEMINI_API_KEY в Render Environment.';
+  }
+
+  if (/model|not found|404/i.test(message)) {
+    return 'Похоже, выбранная Gemini-модель недоступна для этого ключа. Проверьте GEMINI_MODEL в Render Environment.';
+  }
+
+  return 'Не смог ответить из-за ошибки модели. Попробуйте ещё раз или переформулируйте вопрос.';
+}
+
 function cleanBotFormatting(text) {
   return text
     .replace(/\*\*(.*?)\*\*/g, '$1')
@@ -557,7 +581,7 @@ ${userText}`;
     answer = cleanBotFormatting(rawAnswer);
   } catch (error) {
     console.error('LLM error:', error);
-    await ctx.reply('Не смог ответить из-за ошибки модели. Попробуйте ещё раз или переформулируйте вопрос.');
+    await ctx.reply(getFriendlyModelError(error));
     return;
   }
 
