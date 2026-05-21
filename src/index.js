@@ -19,6 +19,13 @@ const PORT = Number(process.env.PORT || 3000);
 const DEFAULT_BOT_MODE = (process.env.RENDER || WEBHOOK_BASE_URL || process.env.PORT) ? 'webhook' : 'polling';
 const BOT_MODE = (process.env.BOT_MODE || DEFAULT_BOT_MODE).toLowerCase();
 const SKIP_SET_WEBHOOK = process.env.SKIP_SET_WEBHOOK === 'true';
+const TRAINING_MEMORY_FILE = process.env.TRAINING_MEMORY_FILE || path.join(process.cwd(), 'data', 'training-memory.json');
+const MAX_TRAINING_ENTRIES = Number(process.env.MAX_TRAINING_ENTRIES || 80);
+const MAX_TRAINING_CHARS = Number(process.env.MAX_TRAINING_CHARS || 12000);
+const TEACHING_ADMIN_IDS = (process.env.TEACHING_ADMIN_IDS || '')
+  .split(',')
+  .map((id) => id.trim())
+  .filter(Boolean);
 
 if (!TELEGRAM_BOT_TOKEN) {
   throw new Error('TELEGRAM_BOT_TOKEN is required');
@@ -46,7 +53,24 @@ const geminiModel = LLM_PROVIDER === 'gemini'
 const openai = LLM_PROVIDER === 'openai' ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const histories = new Map();
+const pendingActions = new Map();
 const TELEGRAM_MESSAGE_LIMIT = 3900;
+
+function loadTrainingMemory() {
+  try {
+    if (!fs.existsSync(TRAINING_MEMORY_FILE)) {
+      return [];
+    }
+
+    const parsed = JSON.parse(fs.readFileSync(TRAINING_MEMORY_FILE, 'utf8'));
+    return Array.isArray(parsed.entries) ? parsed.entries : [];
+  } catch (error) {
+    console.error('Training memory load error:', error);
+    return [];
+  }
+}
+
+let trainingMemory = loadTrainingMemory();
 
 function getHistory(chatId) {
   const history = histories.get(chatId) || [];
@@ -60,19 +84,110 @@ function saveTurn(chatId, userText, assistantText) {
   histories.set(chatId, history.slice(-MAX_HISTORY_MESSAGES));
 }
 
+
+function saveTrainingMemory() {
+  fs.mkdirSync(path.dirname(TRAINING_MEMORY_FILE), { recursive: true });
+  fs.writeFileSync(
+    TRAINING_MEMORY_FILE,
+    JSON.stringify({ entries: trainingMemory }, null, 2),
+    'utf8'
+  );
+}
+
+function isTeachingAllowed(ctx) {
+  if (TEACHING_ADMIN_IDS.length === 0) {
+    return true;
+  }
+
+  return TEACHING_ADMIN_IDS.includes(String(ctx.chat.id)) || TEACHING_ADMIN_IDS.includes(String(ctx.from.id));
+}
+
+function trimTrainingMemory() {
+  trainingMemory = trainingMemory.slice(-MAX_TRAINING_ENTRIES);
+  while (formatTrainingMemory().length > MAX_TRAINING_CHARS && trainingMemory.length > 1) {
+    trainingMemory.shift();
+  }
+}
+
+function addTrainingEntry(type, text, authorId) {
+  const cleanText = text.trim().slice(0, 6000);
+  if (!cleanText) {
+    return null;
+  }
+
+  const entry = {
+    type,
+    text: cleanText,
+    authorId,
+    createdAt: new Date().toISOString()
+  };
+  trainingMemory.push(entry);
+  trimTrainingMemory();
+  saveTrainingMemory();
+  return entry;
+}
+
+function clearTrainingMemory() {
+  trainingMemory = [];
+  saveTrainingMemory();
+}
+
+function formatTrainingMemory() {
+  if (trainingMemory.length === 0) {
+    return '';
+  }
+
+  return trainingMemory
+    .map((entry, index) => `${index + 1}. [${entry.type}] ${entry.text}`)
+    .join('\n');
+}
+
+function buildUserTextWithMemory(userText) {
+  const memory = formatTrainingMemory();
+  if (!memory) {
+    return userText;
+  }
+
+  return [
+    'Додаткове навчання, яке користувач дав боту в Telegram. Враховуй ці правила, прайси, скрипти й задачі як пріоритетні, якщо вони не суперечать безпеці та чесності:',
+    memory,
+    'Поточне повідомлення користувача:',
+    userText
+  ].join('\n\n');
+}
+
+function parseTrainingCommand(text) {
+  const trimmed = text.trim();
+  const slashMatch = trimmed.match(/^\/(teach|prompt)\s+([\s\S]+)/i);
+  if (slashMatch) {
+    return { type: slashMatch[1].toLowerCase(), text: slashMatch[2] };
+  }
+
+  const prefixMatch = trimmed.match(/^(запомни|запам['’]?ятай|запамятай|обучение|навчання|промт|правило)\s*[:\-]\s*([\s\S]+)/i);
+  if (prefixMatch) {
+    const promptPrefixes = ['промт', 'правило'];
+    return {
+      type: promptPrefixes.includes(prefixMatch[1].toLowerCase()) ? 'prompt' : 'teach',
+      text: prefixMatch[2]
+    };
+  }
+
+  return null;
+}
+
 async function generateWithGemini(chatId, userText) {
   const history = getHistory(chatId).map((message) => ({
     role: message.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: message.content }]
   }));
   const chat = geminiModel.startChat({ history });
-  const result = await chat.sendMessage(userText);
+  const result = await chat.sendMessage(buildUserTextWithMemory(userText));
   return result.response.text().trim();
 }
 
 async function generateWithOpenAI(chatId, userText) {
   const messages = [
-    { role: 'system', content: systemPrompt },
+    { role: 'system', content: [systemPrompt, formatTrainingMemory() ? `\n\nДодаткове навчання з Telegram:\n${formatTrainingMemory()}` : ''].join('') },
     ...getHistory(chatId),
     { role: 'user', content: userText }
   ];
@@ -138,6 +253,122 @@ async function replyLong(ctx, text) {
   }
 }
 
+
+function mainMenu() {
+  return {
+    reply_markup: {
+      keyboard: [
+        ['Разобрать клиента', 'Ответ клиенту'],
+        ['Обучить бота', 'Правило поведения'],
+        ['Память бота', 'Инструкция'],
+        ['Примеры', 'Новый диалог'],
+        ['Очистить память']
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: false
+    }
+  };
+}
+
+function menuText() {
+  return [
+    'Главное меню.',
+    '',
+    'Разобрать клиента — помогу понять ситуацию, риски и лучший ход.',
+    'Ответ клиенту — напишу готовый текст для клиента.',
+    'Обучить бота — добавить прайс, скрипт, знания, поставщика или обучение.',
+    'Правило поведения — настроить стиль ответов бота.',
+    'Память бота — показать, что бот запомнил.',
+    'Инструкция — коротко как пользоваться.',
+    'Примеры — готовые запросы.',
+    'Новый диалог — очистить текущий контекст.',
+    'Очистить память — удалить добавленное обучение.'
+  ].join('\n');
+}
+
+function instructionText() {
+  return [
+    'Как пользоваться ботом:',
+    '',
+    '1. Пишите как живому человеку. Можно на русском или украинском.',
+    '',
+    '2. Если нужно продать или ответить клиенту — нажмите «Ответ клиенту» и опишите ситуацию.',
+    '',
+    '3. Если нужно разобрать ситуацию глубже — нажмите «Разобрать клиента».',
+    '',
+    '4. Если хотите обучить бота — нажмите «Обучить бота» и отправьте прайс, скрипт, правило или текст обучения.',
+    '',
+    '5. Если хотите изменить стиль — нажмите «Правило поведения». Например: отвечай короче, сначала давай готовый текст клиенту, не используй звёздочки.',
+    '',
+    '6. Для подбора агрегата лучше давать: авто, год, двигатель, стартер/генератор, фото или номер агрегата, VIN, что случилось, бюджет и срочность.',
+    '',
+    'Команды тоже работают:',
+    '/teach текст обучения',
+    '/prompt правило поведения',
+    '/memory показать память',
+    '/forget_all очистить память',
+    '/menu открыть меню'
+  ].join('\n');
+}
+
+function examplesText() {
+  return [
+    'Примеры, что можно писать:',
+    '',
+    'Клиент говорит дорого 4200 за генератор, что ответить?',
+    '',
+    'Клиент хочет купить по месту. Напиши сильный ответ без давления.',
+    '',
+    'Нужно подобрать стартер на VW T5 2.5, есть только VIN. Какие данные запросить?',
+    '',
+    'Сделай готовый текст клиенту: реставрированный оригинал 4200 грн, гарантия 6 месяцев, отправка сегодня.',
+    '',
+    'Научи меня продавать реставрированный оригинал вместо дешёвого б/у.',
+    '',
+    'Проведи тренировку по возражениям: дорого, подумаю, нашёл дешевле.',
+    '',
+    'Разбери мою переписку с клиентом и скажи, где я теряю продажу.'
+  ].join('\n');
+}
+
+function clientAnalysisPrompt() {
+  return [
+    'Опишите ситуацию клиента одним сообщением.',
+    '',
+    'Лучший формат:',
+    '1. Что нужно: стартер или генератор.',
+    '2. Авто, год, двигатель.',
+    '3. Что говорит клиент.',
+    '4. Цена/варианты, которые есть.',
+    '5. Возражение: дорого, подумаю, по месту, срочно, не подошло.',
+    '',
+    'Я разберу ситуацию, риски, лучший ход и дам готовый ответ клиенту.'
+  ].join('\n');
+}
+
+function clientReplyPrompt() {
+  return [
+    'Опишите, что нужно написать клиенту.',
+    '',
+    'Например:',
+    'Клиент говорит дорого. Генератор реставрированный 4200 грн, гарантия 6 месяцев, отправка сегодня Новой Почтой.',
+    '',
+    'Я дам готовый красивый текст без звёздочек и лишней воды.'
+  ].join('\n');
+}
+
+function setPendingAction(ctx, action) {
+  pendingActions.set(ctx.chat.id, action);
+}
+
+function getPendingAction(ctx) {
+  return pendingActions.get(ctx.chat.id);
+}
+
+function clearPendingAction(ctx) {
+  pendingActions.delete(ctx.chat.id);
+}
+
 async function setWebhookWithRetry(url, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt += 1) {
     try {
@@ -156,33 +387,173 @@ async function setWebhookWithRetry(url, retries = 3) {
 
 bot.start((ctx) => {
   histories.delete(ctx.chat.id);
-  return ctx.reply(
-    'Привет. Я обучающий консультант по стартерам и генераторам. Опиши ситуацию клиента, авто, бюджет или вопрос — подскажу что ответить и какие данные уточнить.'
-  );
+  clearPendingAction(ctx);
+  return ctx.reply(menuText(), mainMenu());
 });
+
+bot.command('menu', (ctx) => ctx.reply(menuText(), mainMenu()));
 
 bot.command('reset', (ctx) => {
   histories.delete(ctx.chat.id);
   return ctx.reply('Контекст очищен. Можете начать новую ситуацию.');
 });
 
-bot.help((ctx) => ctx.reply([
-  'Напишите ситуацию клиента обычным сообщением.',
-  'Примеры:',
-  '• Клиенту дорого 4200 за генератор, что ответить?',
-  '• VW T4 1.9, генератор, есть только VIN — какие вопросы задать?',
-  '• Клиент спрашивает гарантию и талон.'
-].join('\n')));
+bot.command('whoami', (ctx) => ctx.reply(`Ваш chat_id: ${ctx.chat.id}\nВаш user_id: ${ctx.from.id}`));
+
+bot.command(['teach', 'prompt'], async (ctx) => {
+  if (!isTeachingAllowed(ctx)) {
+    return ctx.reply('У вас нет доступа к обучению этого бота.');
+  }
+
+  const text = ctx.message.text.replace(/^\/(teach|prompt)(@\w+)?\s*/i, '').trim();
+  if (!text) {
+    return ctx.reply('Напишите так: /teach новый прайс или правило');
+  }
+
+  const type = ctx.message.text.toLowerCase().startsWith('/prompt') ? 'prompt' : 'teach';
+  addTrainingEntry(type, text, ctx.from.id);
+  return ctx.reply('Запомнил. Теперь буду учитывать это в следующих ответах.', mainMenu());
+});
+
+bot.command('memory', (ctx) => {
+  const memory = formatTrainingMemory();
+  if (!memory) {
+    return ctx.reply('Пока нет дополнительного обучения. Напишите: /teach ваше правило или прайс');
+  }
+
+  return replyLong(ctx, `Что я запомнил:\n\n${memory}`);
+});
+
+bot.command('forget_all', (ctx) => {
+  if (!isTeachingAllowed(ctx)) {
+    return ctx.reply('У вас нет доступа к очистке обучения этого бота.');
+  }
+
+  clearTrainingMemory();
+  return ctx.reply('Готово. Дополнительное обучение очищено.', mainMenu());
+});
+
+bot.help((ctx) => ctx.reply(instructionText(), mainMenu()));
 
 bot.on('text', async (ctx) => {
   const userText = ctx.message.text.trim();
   if (!userText) return;
 
+  if (userText === 'Разобрать клиента') {
+    setPendingAction(ctx, 'analyze_client');
+    await ctx.reply(clientAnalysisPrompt(), mainMenu());
+    return;
+  }
+
+  if (userText === 'Ответ клиенту') {
+    setPendingAction(ctx, 'client_reply');
+    await ctx.reply(clientReplyPrompt(), mainMenu());
+    return;
+  }
+
+  if (userText === 'Новый диалог') {
+    histories.delete(ctx.chat.id);
+    clearPendingAction(ctx);
+    await ctx.reply('Готово. Контекст очищен, можно начать новую ситуацию.', mainMenu());
+    return;
+  }
+
+  if (userText === 'Обучить бота') {
+    setPendingAction(ctx, 'teach');
+    await ctx.reply('Отправьте одним сообщением обучение: прайс, скрипт, правило, информацию по поставщику или любой текст, который бот должен учитывать.', mainMenu());
+    return;
+  }
+
+  if (userText === 'Правило поведения') {
+    setPendingAction(ctx, 'prompt');
+    await ctx.reply('Отправьте правило поведения. Например: отвечай короче, сначала давай готовый текст клиенту, не используй звёздочки.', mainMenu());
+    return;
+  }
+
+  if (userText === 'Память бота') {
+    const memory = formatTrainingMemory();
+    await replyLong(ctx, memory ? `Что я запомнил:
+
+${memory}` : 'Пока нет дополнительного обучения. Нажмите «Обучить бота» и отправьте текст.');
+    return;
+  }
+
+  if (userText === 'Инструкция') {
+    await replyLong(ctx, instructionText());
+    return;
+  }
+
+  if (userText === 'Примеры') {
+    await replyLong(ctx, examplesText());
+    return;
+  }
+
+  if (userText === 'Очистить память') {
+    setPendingAction(ctx, 'confirm_forget');
+    await ctx.reply('Точно очистить всю память обучения? Напишите ДА для подтверждения или НЕТ для отмены.', mainMenu());
+    return;
+  }
+
+  const pendingAction = getPendingAction(ctx);
+  if (pendingAction) {
+    if (pendingAction === 'confirm_forget') {
+      if (/^(да|так|yes)$/i.test(userText.trim())) {
+        if (!isTeachingAllowed(ctx)) {
+          await ctx.reply('У вас нет доступа к очистке обучения этого бота.', mainMenu());
+          clearPendingAction(ctx);
+          return;
+        }
+
+        clearTrainingMemory();
+        clearPendingAction(ctx);
+        await ctx.reply('Готово. Память обучения очищена.', mainMenu());
+        return;
+      }
+
+      clearPendingAction(ctx);
+      await ctx.reply('Ок, не очищаю память.', mainMenu());
+      return;
+    }
+
+    if (pendingAction === 'analyze_client' || pendingAction === 'client_reply') {
+      clearPendingAction(ctx);
+      const prefix = pendingAction === 'client_reply'
+        ? 'Напиши готовый красивый ответ клиенту без markdown, без звёздочек и без лишней воды. Ситуация:'
+        : 'Разбери ситуацию клиента глубоко: что происходит, риски, лучший ход, готовый текст клиенту и следующий шаг. Ситуация:';
+      ctx.message.text = `${prefix}
+${userText}`;
+    } else {
+      if (!isTeachingAllowed(ctx)) {
+        await ctx.reply('У вас нет доступа к обучению этого бота.', mainMenu());
+        clearPendingAction(ctx);
+        return;
+      }
+
+      addTrainingEntry(pendingAction, userText, ctx.from.id);
+      clearPendingAction(ctx);
+      await ctx.reply('Запомнил. Теперь буду учитывать это в следующих ответах.', mainMenu());
+      return;
+    }
+  }
+
+  const effectiveUserText = ctx.message.text.trim();
+  const trainingCommand = parseTrainingCommand(effectiveUserText);
+  if (trainingCommand) {
+    if (!isTeachingAllowed(ctx)) {
+      await ctx.reply('У вас нет доступа к обучению этого бота.');
+      return;
+    }
+
+    addTrainingEntry(trainingCommand.type, trainingCommand.text, ctx.from.id);
+    await ctx.reply('Запомнил. Теперь буду учитывать это в следующих ответах.');
+    return;
+  }
+
   await ctx.sendChatAction('typing');
 
   let answer;
   try {
-    const rawAnswer = await generateAnswer(ctx.chat.id, userText) || 'Не удалось сформировать ответ.';
+    const rawAnswer = await generateAnswer(ctx.chat.id, effectiveUserText) || 'Не удалось сформировать ответ.';
     answer = cleanBotFormatting(rawAnswer);
   } catch (error) {
     console.error('LLM error:', error);
@@ -190,7 +561,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  saveTurn(ctx.chat.id, userText, answer);
+  saveTurn(ctx.chat.id, effectiveUserText, answer);
 
   try {
     await replyLong(ctx, answer);
