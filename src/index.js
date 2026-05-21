@@ -46,6 +46,7 @@ const geminiModel = LLM_PROVIDER === 'gemini'
 const openai = LLM_PROVIDER === 'openai' ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const histories = new Map();
+const TELEGRAM_MESSAGE_LIMIT = 3900;
 
 function getHistory(chatId) {
   const history = histories.get(chatId) || [];
@@ -100,6 +101,43 @@ function cleanBotFormatting(text) {
     .trim();
 }
 
+function splitTelegramMessage(text) {
+  if (text.length <= TELEGRAM_MESSAGE_LIMIT) {
+    return [text];
+  }
+
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > TELEGRAM_MESSAGE_LIMIT) {
+    let splitAt = remaining.lastIndexOf('\n\n', TELEGRAM_MESSAGE_LIMIT);
+    if (splitAt < TELEGRAM_MESSAGE_LIMIT * 0.5) {
+      splitAt = remaining.lastIndexOf('\n', TELEGRAM_MESSAGE_LIMIT);
+    }
+    if (splitAt < TELEGRAM_MESSAGE_LIMIT * 0.5) {
+      splitAt = remaining.lastIndexOf('. ', TELEGRAM_MESSAGE_LIMIT);
+    }
+    if (splitAt < TELEGRAM_MESSAGE_LIMIT * 0.5) {
+      splitAt = TELEGRAM_MESSAGE_LIMIT;
+    }
+
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+
+  if (remaining) {
+    chunks.push(remaining);
+  }
+
+  return chunks;
+}
+
+async function replyLong(ctx, text) {
+  const chunks = splitTelegramMessage(text);
+  for (const chunk of chunks) {
+    await ctx.reply(chunk, { disable_web_page_preview: true });
+  }
+}
+
 async function setWebhookWithRetry(url, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt += 1) {
     try {
@@ -142,14 +180,23 @@ bot.on('text', async (ctx) => {
 
   await ctx.sendChatAction('typing');
 
+  let answer;
   try {
     const rawAnswer = await generateAnswer(ctx.chat.id, userText) || 'Не удалось сформировать ответ.';
-    const answer = cleanBotFormatting(rawAnswer);
-    saveTurn(ctx.chat.id, userText, answer);
-    await ctx.reply(answer, { disable_web_page_preview: true });
+    answer = cleanBotFormatting(rawAnswer);
   } catch (error) {
     console.error('LLM error:', error);
     await ctx.reply('Не смог ответить из-за ошибки модели. Попробуйте ещё раз или переформулируйте вопрос.');
+    return;
+  }
+
+  saveTurn(ctx.chat.id, userText, answer);
+
+  try {
+    await replyLong(ctx, answer);
+  } catch (error) {
+    console.error('Telegram reply error:', error);
+    await ctx.reply('Ответ получился слишком длинный или Telegram не принял сообщение. Напишите “короче” — я дам сжатую версию.');
   }
 });
 
