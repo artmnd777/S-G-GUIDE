@@ -13,10 +13,11 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5.5';
 const MAX_HISTORY_MESSAGES = Number(process.env.MAX_HISTORY_MESSAGES || 12);
-const BOT_MODE = (process.env.BOT_MODE || (process.env.RENDER ? 'webhook' : 'polling')).toLowerCase();
 const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL;
 const WEBHOOK_PATH = process.env.WEBHOOK_PATH || '/telegram-webhook';
 const PORT = Number(process.env.PORT || 3000);
+const DEFAULT_BOT_MODE = (process.env.RENDER || WEBHOOK_BASE_URL || process.env.PORT) ? 'webhook' : 'polling';
+const BOT_MODE = (process.env.BOT_MODE || DEFAULT_BOT_MODE).toLowerCase();
 const SKIP_SET_WEBHOOK = process.env.SKIP_SET_WEBHOOK === 'true';
 
 if (!TELEGRAM_BOT_TOKEN) {
@@ -89,6 +90,16 @@ async function generateAnswer(chatId, userText) {
   return generateWithGemini(chatId, userText);
 }
 
+function cleanBotFormatting(text) {
+  return text
+    .replace(/\*\*(.*?)\*\*/g, '$1')
+    .replace(/\*(.*?)\*/g, '$1')
+    .replace(/^\s*[*•]\s+/gm, '')
+    .replace(/^\s*-\s+/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 async function setWebhookWithRetry(url, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt += 1) {
     try {
@@ -132,7 +143,8 @@ bot.on('text', async (ctx) => {
   await ctx.sendChatAction('typing');
 
   try {
-    const answer = await generateAnswer(ctx.chat.id, userText) || 'Не удалось сформировать ответ.';
+    const rawAnswer = await generateAnswer(ctx.chat.id, userText) || 'Не удалось сформировать ответ.';
+    const answer = cleanBotFormatting(rawAnswer);
     saveTurn(ctx.chat.id, userText, answer);
     await ctx.reply(answer, { disable_web_page_preview: true });
   } catch (error) {
